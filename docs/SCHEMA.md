@@ -77,7 +77,7 @@ erDiagram
 | `recycling_tips` | `text` | |
 | `location_lat` | `decimal(10,8)` | Nullable, never populated |
 | `location_lng` | `decimal(11,8)` | Nullable, never populated |
-| `verification_status` | `enum('pending','approved','rejected')` | DEFAULT `'pending'` |
+| `verification_status` | `enum('pending','approved','rejected')` | DEFAULT `'pending'`. Lifecycle diagram in the [README](../README.md#what-it-does) — points are credited only on the transition to `approved` |
 | `verified_by` | `int(11)` | FK → `users`. The approving admin |
 | `verified_at` | `timestamp` | Nullable |
 | `scan_timestamp` | `timestamp` | DEFAULT `current_timestamp()` |
@@ -124,7 +124,20 @@ Keeping `gemini_raw_response` means every classification decision is reconstruct
 
 **Indexes** — PK `redemption_id`; UNIQUE `redemption_code`; `reward_id`, `idx_user_history (user_id, redeemed_at)`.
 
+```mermaid
+stateDiagram-v2
+    [*] --> pending: POST /api/rewards/redeem — points deducted here
+    pending --> completed: POST /api/admin/redemptions/:id/approve
+    pending --> cancelled: POST /api/admin/redemptions/:id/reject
+    completed --> [*]: redemption_code issued, completed_at set
+    cancelled --> [*]: points_spent refunded to total_points
+```
+
+`status` looks like `scans.verification_status` and behaves differently in the one way that matters. A `pending` scan has cost the user nothing, so rejecting it reverses nothing. A `pending` redemption has **already** been paid for — `POST /api/rewards/redeem` deducts `total_points` before the row is inserted — so `cancelled` is not a no-op but a compensating write that returns `points_spent`. Deducting up front is what stops the same balance being spent twice while approvals queue up; the cost is that every path out of `pending` other than `completed` has to remember to refund.
+
 `points_spent` is stored rather than joined from `rewards.points_cost` so that repricing a reward does not retroactively change what a past redemption cost, and so the refund on rejection returns exactly what was taken.
+
+The chatbot's `redeemReward` creates rows in this same `pending` state but generates `redemption_code` at creation instead of at approval — see [ENGINEERING.md § Limitations](ENGINEERING.md#limitations).
 
 ---
 

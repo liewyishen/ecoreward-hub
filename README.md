@@ -22,6 +22,20 @@ Points are never awarded by the AI alone — classification and crediting are de
 2. **`POST /api/scan/submit`** — user picks a drop-off facility. A `scans` row is written as `pending`. Still no points.
 3. **`POST /api/admin/scans/:id/approve`** — an admin reviews the image. Only now are points credited, `total_scans` incremented, achievements evaluated, and email sent.
 
+```mermaid
+stateDiagram-v2
+    state "analyzed (nothing written)" as analyzed
+
+    [*] --> analyzed: POST /api/scan/analyze
+    analyzed --> pending: POST /api/scan/submit
+    pending --> approved: POST /api/admin/scans/:id/approve
+    pending --> rejected: POST /api/admin/scans/:id/reject
+    approved --> [*]: points credited, achievements evaluated
+    rejected --> [*]: no points were ever granted
+```
+
+The classification is done by the model; the crediting is done by a person. `analyze` writes nothing at all — the result exists only in the client's hands until the user chooses to submit it — and `users.total_points` is written in exactly one place on this path, inside the transaction in `approve`. A misclassification therefore cannot turn into points without an admin having looked at the image it came from. Submission is not entirely without effect, only without *points*: it writes the `scans` row, increments `item_type_stats.total_scanned`, and advances the daily streak.
+
 Rejection marks the scan `rejected`; since points were never granted, nothing is reversed. Points are `round(base_points × confidence)`, with `base_points` from `item_type_stats` (E-waste 25 down to Organic 5).
 
 Redemptions use the same pending-then-approve shape, except points are deducted at request time so a pending redemption cannot be double-spent — approval issues a voucher code, rejection refunds.
