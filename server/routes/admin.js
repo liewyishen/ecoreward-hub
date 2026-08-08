@@ -149,13 +149,47 @@ router.post('/redemptions/:id/approve', async (req, res) => {
 
     const { id } = req.params;
 
-    // Get redemption details including user email
+    // Generate unique voucher code
+    const timestamp = Date.now();
+    const randomStr = Math.random().toString(36).substr(2, 6).toUpperCase();
+    const voucherCode = `ECO${timestamp}${randomStr}`;
+
+    // Claim the redemption in the same statement that checks its state. The
+    // previous version only refused rows that were already 'completed', which
+    // left 'cancelled' approvable: the user kept the refund and received a
+    // voucher on top of it. Only a pending redemption can be approved.
+    const [claim] = await connection.query(
+      `UPDATE redemptions
+       SET status = 'completed', redemption_code = ?, completed_at = NOW()
+       WHERE redemption_id = ? AND status = 'pending'`,
+      [voucherCode, id]
+    );
+
+    if (claim.affectedRows === 0) {
+      const [existing] = await connection.query(
+        'SELECT status FROM redemptions WHERE redemption_id = ?',
+        [id]
+      );
+      await connection.rollback();
+
+      if (existing.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Redemption not found',
+        });
+      }
+
+      return res.status(409).json({
+        success: false,
+        message: `Redemption is already ${existing[0].status} and cannot be approved`,
+      });
+    }
+
+    // Details for the confirmation email
     const [redemption] = await connection.query(
       `
       SELECT
-        rd.redemption_code,
         rd.points_spent,
-        rd.status,
         u.username,
         u.email,
         rw.reward_name
@@ -167,28 +201,7 @@ router.post('/redemptions/:id/approve', async (req, res) => {
       [id]
     );
 
-    if (redemption.length === 0) {
-      throw new Error('Redemption not found');
-    }
-
-    const { username, email, reward_name, points_spent, status } =
-      redemption[0];
-
-    // Check if already approved
-    if (status === 'completed') {
-      throw new Error('Redemption already approved');
-    }
-
-    // Generate unique voucher code
-    const timestamp = Date.now();
-    const randomStr = Math.random().toString(36).substr(2, 6).toUpperCase();
-    const voucherCode = `ECO${timestamp}${randomStr}`;
-
-    // Update status to completed and set voucher code
-    await connection.query(
-      'UPDATE redemptions SET status = ?, redemption_code = ?, completed_at = NOW() WHERE redemption_id = ?',
-      ['completed', voucherCode, id]
-    );
+    const { username, email, reward_name, points_spent } = redemption[0];
 
     // Commit database changes FIRST
     await connection.commit();
@@ -241,25 +254,48 @@ router.post('/redemptions/:id/reject', async (req, res) => {
 
     const { id } = req.params;
 
-    // Get redemption details
+    // Claim the redemption before refunding anything. Putting the current status
+    // in the WHERE clause is what makes this safe: a second rejection — whether it
+    // arrives a minute later or concurrently — matches zero rows and never reaches
+    // the refund below. Reading the status and then updating would leave a window
+    // in which both requests pass the check and the user is credited twice.
+    const [claim] = await connection.query(
+      `UPDATE redemptions
+       SET status = 'cancelled'
+       WHERE redemption_id = ? AND status = 'pending'`,
+      [id]
+    );
+
+    if (claim.affectedRows === 0) {
+      const [existing] = await connection.query(
+        'SELECT status FROM redemptions WHERE redemption_id = ?',
+        [id]
+      );
+      await connection.rollback();
+
+      if (existing.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Redemption not found',
+        });
+      }
+
+      // Already completed (voucher issued) or already cancelled (points refunded).
+      // Either way there is nothing to refund and retrying will not help.
+      return res.status(409).json({
+        success: false,
+        message: `Redemption is already ${existing[0].status} and cannot be rejected`,
+      });
+    }
+
     const [redemption] = await connection.query(
       'SELECT user_id, points_spent FROM redemptions WHERE redemption_id = ?',
       [id]
     );
 
-    if (redemption.length === 0) {
-      throw new Error('Redemption not found');
-    }
-
     const { user_id, points_spent } = redemption[0];
 
-    // Reject redemption
-    await connection.query(
-      'UPDATE redemptions SET status = ? WHERE redemption_id = ?',
-      ['cancelled', id]
-    );
-
-    // Refund points
+    // Refund exactly what was taken at request time
     await connection.query(
       'UPDATE users SET total_points = total_points + ? WHERE user_id = ?',
       [points_spent, user_id]
@@ -430,7 +466,42 @@ router.post('/scans/:id/approve', async (req, res) => {
     const { id } = req.params;
     const admin_id = req.user.user_id;
 
-    // Get scan details
+    // Claim the scan before crediting anything. The status is part of the WHERE
+    // clause so that a second approval matches zero rows instead of running the
+    // point award, the total_scans increment and the achievement check a second
+    // time. This runs before the read because the claim, not the read, is what
+    // decides whether the rest of the handler may proceed.
+    const [claim] = await connection.query(
+      `UPDATE scans
+       SET verification_status = 'approved',
+           verified_by = ?,
+           verified_at = NOW()
+       WHERE scan_id = ? AND verification_status = 'pending'`,
+      [admin_id, id]
+    );
+
+    if (claim.affectedRows === 0) {
+      const [existing] = await connection.query(
+        'SELECT verification_status FROM scans WHERE scan_id = ?',
+        [id]
+      );
+      await connection.rollback();
+
+      if (existing.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Scan not found',
+        });
+      }
+
+      return res.status(409).json({
+        success: false,
+        message: `Scan is already ${existing[0].verification_status} and cannot be approved`,
+      });
+    }
+
+    // Get scan details. total_points is still the pre-credit balance here, which
+    // is what the email needs to report the new total.
     const [scan] = await connection.query(
       `
       SELECT
@@ -461,16 +532,6 @@ router.post('/scans/:id/approve', async (req, res) => {
       email,
       total_points,
     } = scan[0];
-
-    // Update scan status
-    await connection.query(
-      `UPDATE scans
-       SET verification_status = 'approved',
-           verified_by = ?,
-           verified_at = NOW()
-       WHERE scan_id = ?`,
-      [admin_id, id]
-    );
 
     // Award points to user (streak is now updated on scan SUBMISSION, not approval)
     // Only increment total_scans here since streak was already counted when user submitted
@@ -608,14 +669,37 @@ router.post('/scans/:id/reject', async (req, res) => {
     const { id } = req.params;
     const admin_id = req.user.user_id;
 
-    await db.query(
+    // Same guard as the approve path. Rejecting twice would be harmless on its own
+    // — no points move here — but without the status in the WHERE clause an already
+    // approved scan could be flipped to 'rejected' while the points it granted stay
+    // on the account, leaving the row and the balance permanently disagreeing.
+    const [claim] = await db.query(
       `UPDATE scans
        SET verification_status = 'rejected',
            verified_by = ?,
            verified_at = NOW()
-       WHERE scan_id = ?`,
+       WHERE scan_id = ? AND verification_status = 'pending'`,
       [admin_id, id]
     );
+
+    if (claim.affectedRows === 0) {
+      const [existing] = await db.query(
+        'SELECT verification_status FROM scans WHERE scan_id = ?',
+        [id]
+      );
+
+      if (existing.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Scan not found',
+        });
+      }
+
+      return res.status(409).json({
+        success: false,
+        message: `Scan is already ${existing[0].verification_status} and cannot be rejected`,
+      });
+    }
 
     console.log(`❌ Scan rejected: scan_id=${id}, admin_id=${admin_id}`);
 

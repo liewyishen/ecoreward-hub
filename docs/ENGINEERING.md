@@ -153,6 +153,80 @@ The five mutating admin endpoints were exercised against purpose-built fixture r
 
 ---
 
+## 5. A refund that could be collected twice
+
+**Symptom.** No outage, no error, no failing request. Found while writing the redemption state diagram for [SCHEMA.md](SCHEMA.md#redemptions): drawing `pending → cancelled` meant naming what happens on that edge, which is a refund, which raised the question of what happens if the edge is taken twice. `POST /api/admin/redemptions/:id/reject` answered it by returning `200 Reward rejected and points refunded` every time and crediting `points_spent` again on each call.
+
+**Root cause.** The handler read the row, then wrote, and never looked at `status` in between:
+
+```js
+const [redemption] = await connection.query(
+  'SELECT user_id, points_spent FROM redemptions WHERE redemption_id = ?', [id]);
+// ...
+await connection.query(
+  'UPDATE redemptions SET status = ? WHERE redemption_id = ?', ['cancelled', id]);
+await connection.query(
+  'UPDATE users SET total_points = total_points + ? WHERE user_id = ?',
+  [points_spent, user_id]);
+```
+
+`status` was not selected, so it could not be checked. The transaction is real and the rollback is correct, but atomicity is not idempotence: each call is individually well-formed, and nothing says a well-formed call may only happen once. An admin double-clicking Reject, or a retried request after a timeout, mints points out of nothing.
+
+Comparing the two handlers side by side is what made the shape of the problem visible. The sibling endpoint `POST /api/admin/redemptions/:id/approve` *did* have a check — `if (status === 'completed') throw` — which is why the omission in `reject` had not been noticed. That check turned out to be incomplete in its own way: it refused only `completed`, leaving `cancelled → completed` reachable, so a rejected redemption could be approved afterwards and the user would keep the refund *and* receive a voucher.
+
+Auditing the two scan endpoints for the same shape found the same thing again. `POST /api/admin/scans/:id/approve` had no state check at all: a second approval re-ran the point award, the `total_scans` increment and the achievement evaluation. `POST /api/admin/scans/:id/reject` was harmless on repeat — it moves no points — but could flip an already-approved scan to `rejected` while the points it granted stayed on the account, leaving the row and the balance permanently disagreeing.
+
+So one endpoint had a correct-looking guard, one had a partial guard, and two had none. This is note 3's failure mode wearing different clothes: four copies of one decision, updated independently.
+
+**Fix.** Rather than adding a read-then-check to each handler, the state check was folded into the write. The row is claimed by an `UPDATE` whose `WHERE` clause names the state it is allowed to move from, and `affectedRows` is the authority on whether the claim succeeded:
+
+```js
+const [claim] = await connection.query(
+  `UPDATE redemptions
+   SET status = 'cancelled'
+   WHERE redemption_id = ? AND status = 'pending'`,
+  [id]
+);
+
+if (claim.affectedRows === 0) {
+  const [existing] = await connection.query(
+    'SELECT status FROM redemptions WHERE redemption_id = ?', [id]);
+  await connection.rollback();
+
+  if (existing.length === 0) {
+    return res.status(404).json({ success: false, message: 'Redemption not found' });
+  }
+  return res.status(409).json({ success: false,
+    message: `Redemption is already ${existing[0].status} and cannot be rejected` });
+}
+// only past this line does the refund run
+```
+
+There is no window between the check and the write because there is no separate check. The `UPDATE` takes an exclusive row lock, so a concurrent second request blocks until the first transaction commits and then matches zero rows — the guard holds against a retry a minute later and against two simultaneous clicks equally. The same pattern was applied to all four endpoints, with `verification_status = 'pending'` as the claimed state for scans.
+
+**Status codes.** A state conflict is now **409**, not the 500 the previous `throw` produced, and a missing row is **404**. The distinction is the same one drawn in note 3: 409 tells the caller that the request was well-formed and will never succeed as sent, which is exactly what the admin UI needs to show "already processed" instead of "server error, try again" — retrying was the thing causing the damage.
+
+**Verification.** Tested against a running server and a live database, using a purpose-built user seeded at 800 points with one `pending` redemption worth 200 and one `pending` scan worth 10. Each row of the table is a real HTTP call with the balance read back from the database afterwards.
+
+| Scenario | Before | After |
+|---|---|---|
+| Reject a pending redemption | 200 · 800 → 1000 | 200 · 800 → 1000 |
+| Reject the same redemption again | **200 · 1000 → 1200** | **409 · 1000** |
+| Reject it a third time | **200 · 1200 → 1400** | **409 · 1000** |
+| Approve a redemption already `cancelled` | **200 · voucher issued** | **409 · `redemption_code` stays NULL** |
+| Reject a redemption id that does not exist | 500 | 404 |
+| Approve a pending scan | 200 · +10 pts, `total_scans` 3 → 4 | 200 · +10 pts, `total_scans` 3 → 4 |
+| Approve the same scan again | **200 · +10 pts, `total_scans` → 5** | **409 · balance and counter unchanged** |
+| Reject a scan already `approved` | **200 · marked rejected, points kept** | **409 · row unchanged** |
+| Approve a pending redemption (happy path) | 200 · voucher, `completed_at` set | 200 · voucher, `completed_at` set |
+| Reject a pending scan (happy path) | 200 · `verified_by` set | 200 · `verified_by` set |
+
+Three consecutive rejections took the account from 800 to 1400 on the unfixed code — 400 points that no scan ever earned — and left it at 1000 on the fixed code. The fixture user and all its rows were deleted afterwards; row counts and the sum of `total_points` across the database matched the pre-test baseline exactly.
+
+**Trade-off.** The failure path now costs a second query, because `affectedRows === 0` says the claim failed without saying why — the row could be missing or merely in the wrong state, and 404 and 409 mean different things to the caller. Paying for that read only when the claim fails keeps the success path at one statement, which is the path that actually runs. The larger trade is that this makes the *state transition* idempotent and does nothing for the balance itself: `POST /api/rewards/redeem` still reads a balance, checks it, and writes without a lock, so the concurrent-spend race below remains open. Guarding a transition is not the same as guarding an amount, and conflating the two would have made this note read as a fix for something it does not fix.
+
+---
+
 ## Limitations
 
 Known and unresolved, listed so a reader does not have to find them.
