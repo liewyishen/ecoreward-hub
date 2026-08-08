@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Environment
+.env
+.env.*
+*/.env
+*/.env.*
+!.env.example
+!*/.env.example
+
+# Database dumps (contain real emails and bcrypt hashes)
+server/ecoreward_db.sql
+server/ecoreward_db_backup.sql
+server/start_fresh.sql
+
+# User uploads
+server/uploads/
+
+# Superseded FYP-era documentation
+README.old.md
+
+# Local tooling
+.claude/
+
+# Build output
+dist/
+build/
+*/dist/
+*/build/
+
+# Misc
+*.log
+npm-debug.log*
+.DS_Store
+.vscode/
+.idea/
+coverage/
